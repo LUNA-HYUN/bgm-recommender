@@ -4,3 +4,6 @@ librosa
 scikit-learn
 gradio
 numpy
+deep-translator
+joblib
+pandas

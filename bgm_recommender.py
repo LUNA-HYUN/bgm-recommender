@@ -56,7 +56,7 @@ def extract_bgm_features(bgm_folder: str) -> dict:
                 'spectral_flux': spectral_flux,
                 'mfcc': mfcc_mean,
             }
-            print(f"  완료: tempo={tempo:.1f}, rms={rms:.4f}, zcr={zcr:.4f}, flux={spectral_flux:.4f}")
+            print(f"  완료: rms={rms:.4f}, zcr={zcr:.4f}, flux={spectral_flux:.4f}, centroid={spectral_centroid:.1f}")
 
         except Exception as e:
             print(f"  오류 ({filename}): {e}")
@@ -80,27 +80,58 @@ def load_bgm_db(path: str = "bgm_db.json") -> dict:
 # ── 2단계: 텍스트 감정 분석 ──────────────────────────────────
 def preprocess_text(text: str) -> str:
     """
-    KoNLPy Okt로 한국어 형태소 분석
-    형용사·동사·명사만 추출 후 영어로 번역하여 반환
+    1. KoNLPy Okt로 한국어 형태소 분석 (전체 텍스트)
+    2. 형용사·동사·명사만 추출 후 문장 단위로 영어로 번역
+    3. 번역된 문장에서 감정이 강한 핵심 문장 자동 추출
     """
     from konlpy.tag import Okt
     from deep_translator import GoogleTranslator
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    import re
 
     okt = Okt()
+    analyzer = SentimentIntensityAnalyzer()
+    translator = GoogleTranslator(source='ko', target='en')
 
-    # 형용사(Adjective), 동사(Verb), 명사(Noun)만 추출
-    target_pos = {'Adjective', 'Verb', 'Noun'}
-    tokens = [
-        word for word, pos in okt.pos(text, stem=True)
-        if pos in target_pos
-    ]
-    korean = ' '.join(tokens)
-    print(f"  형태소 추출: {korean}")
+    # 문장 단위 분리
+    sentences = re.split(r'[.\n]', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
 
-    # 영어로 번역
-    translated = GoogleTranslator(source='ko', target='en').translate(korean)
-    print(f"  영어 번역: {translated}")
-    return translated
+    if not sentences:
+        return text
+
+    # 각 문장별 형태소 추출 → 번역 → 감정 점수 계산
+    translated_scored = []
+    for s in sentences:
+        target_pos = {'Adjective', 'Verb', 'Noun'}
+        tokens = [
+            word for word, pos in okt.pos(s, stem=True)
+            if pos in target_pos
+        ]
+        if not tokens:
+            continue
+        korean = ' '.join(tokens)
+        try:
+            translated = translator.translate(korean)
+        except Exception:
+            translated = korean
+        score = analyzer.polarity_scores(translated)
+        translated_scored.append((translated, abs(score['compound'])))
+
+    if not translated_scored:
+        return text
+
+    # 문장이 3개 이하면 전체 사용, 초과면 감정 강한 상위 3개 추출
+    if len(translated_scored) <= 3:
+        key = [s for s, _ in translated_scored]
+    else:
+        translated_scored.sort(key=lambda x: x[1], reverse=True)
+        key = [s for s, _ in translated_scored[:3]]
+        print(f"  핵심 문장 추출: {len(translated_scored)}개 → 상위 3개")
+
+    result = ' '.join(key)
+    print(f"  영어 번역 결과: {result[:120]}...")
+    return result
 
 
 def analyze_sentiment(text: str) -> dict:
@@ -234,9 +265,9 @@ def match_bgm(emotion_vector: np.ndarray, bgm_db: dict, top_n: int = 3) -> list:
     top_score = results[0]['score'] if results else 0
     if top_score < 0.6:
         top_n = min(5, len(results))
-        print(f"  일치도가 낮아 추천 수를 {top_n}개로 확장")
+        print(f"  일치도가 낮아 추천 수를 {top_n}개로 자동 확장")
 
-    return results[:top_n]
+    return results  # 전체 반환 (UI에서 더보기 처리)
 
 
 # ── 4단계: 전체 파이프라인 ───────────────────────────────────
@@ -298,15 +329,20 @@ def build_ui():
 
                 # 추천 결과 표시
                 result_output = gr.Textbox(label='추천 BGM 목록', lines=5, interactive=False)
+                more_btn = gr.Button('더보기 ↓', visible=False)
 
                 # 미리 듣기
                 audio_output1 = gr.Audio(label='1순위 BGM 미리 듣기')
                 audio_output2 = gr.Audio(label='2순위 BGM 미리 듣기')
                 audio_output3 = gr.Audio(label='3순위 BGM 미리 듣기')
 
+        # 전체 결과 저장용 State
+        all_results_state = gr.State([])
+
         def on_recommend(scene_text, neg_val, pos_val, neu_val):
             if not scene_text.strip():
-                return '텍스트를 입력해주세요.', '', None, None, None
+                return ('텍스트를 입력해주세요.', '',
+                        None, None, None, [], gr.update(visible=False))
 
             # 수동 보정값 적용 여부 판단
             emotion_adjust = None
@@ -319,10 +355,9 @@ def build_ui():
                         'neu': neu_val / total,
                     }
 
-            results = recommend_bgm(scene_text, emotion_adjust)
+            all_results = recommend_bgm(scene_text, emotion_adjust)
 
             # 감정 분석 결과 텍스트
-            bgm_db = load_bgm_db()
             processed = preprocess_text(scene_text)
             sentiment = analyze_sentiment(processed)
             valence = sentiment['compound']
@@ -338,28 +373,68 @@ def build_ui():
                 adj_valence = emotion_adjust['pos'] - emotion_adjust['neg']
                 emotion_text += f"\n수동 보정: valence={adj_valence:.2f}, arousal={abs(adj_valence):.2f}"
 
+            # 일치도 낮으면 5개, 높으면 3개 기본 표시
+            top_score = all_results[0]['score'] if all_results else 0
+            default_n = 5 if top_score < 0.6 else 3
+            display = all_results[:default_n]
+
             # 추천 결과 텍스트
             result_lines = []
-            for i, r in enumerate(results, 1):
+            for i, r in enumerate(display, 1):
                 result_lines.append(f"{i}위. {r['filename']}  (일치도: {r['score']:.1%})")
+            if top_score < 0.6:
+                result_lines.append(f"\n※ 일치도가 낮아 추천 수를 {default_n}개로 자동 확장했어요.")
             result_text = '\n'.join(result_lines)
 
-            # 미리 듣기 파일 경로
+            # 미리 듣기 (상위 3개)
             bgm_folder = 'bgm'
             audio_paths = []
-            for r in results[:3]:
+            for r in display[:3]:
                 path = os.path.join(bgm_folder, r['filename'])
                 audio_paths.append(path if os.path.exists(path) else None)
-
             while len(audio_paths) < 3:
                 audio_paths.append(None)
 
-            return emotion_text, result_text, audio_paths[0], audio_paths[1], audio_paths[2]
+            show_more = len(all_results) > default_n
+
+            return (emotion_text, result_text,
+                    audio_paths[0], audio_paths[1], audio_paths[2],
+                    all_results, gr.update(visible=show_more))
+
+        def on_show_more(all_results):
+            if not all_results:
+                return '', None, None, None, [], gr.update(visible=False)
+
+            result_lines = []
+            for i, r in enumerate(all_results, 1):
+                result_lines.append(f"{i}위. {r['filename']}  (일치도: {r['score']:.1%})")
+            result_text = '\n'.join(result_lines)
+
+            bgm_folder = 'bgm'
+            audio_paths = []
+            for r in all_results[:3]:
+                path = os.path.join(bgm_folder, r['filename'])
+                audio_paths.append(path if os.path.exists(path) else None)
+            while len(audio_paths) < 3:
+                audio_paths.append(None)
+
+            return (result_text,
+                    audio_paths[0], audio_paths[1], audio_paths[2],
+                    [], gr.update(visible=False))
 
         recommend_btn.click(
             fn=on_recommend,
             inputs=[scene_input, neg_slider, pos_slider, neu_slider],
-            outputs=[emotion_output, result_output, audio_output1, audio_output2, audio_output3],
+            outputs=[emotion_output, result_output,
+                     audio_output1, audio_output2, audio_output3,
+                     all_results_state, more_btn],
+        )
+        more_btn.click(
+            fn=on_show_more,
+            inputs=[all_results_state],
+            outputs=[result_output,
+                     audio_output1, audio_output2, audio_output3,
+                     all_results_state, more_btn],
         )
 
     demo.launch()
