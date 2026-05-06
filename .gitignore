@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# audio
+bgm_db.json
+bgm/*.mp3
+bgm/*.wav
+bgm/*.ogg

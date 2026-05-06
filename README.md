@@ -3,5 +3,7 @@
 경희대학교 SWCON103 디자인적 사고 프로젝트
 
 ## 실행 방법
+```bash
 pip install -r requirements.txt
 python bgm_recommender.py
+```
