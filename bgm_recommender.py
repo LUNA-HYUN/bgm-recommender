@@ -39,9 +39,9 @@ def extract_bgm_features(bgm_folder: str) -> dict:
             # zero crossing rate 평균 (타악기성/노이즈성)
             zcr = float(np.mean(librosa.feature.zero_crossing_rate(y=y)))
 
-            # spectral contrast 평균 (스펙트럼 피크와 골의 차이)
-            spectral_contrast = float(np.mean(
-                librosa.feature.spectral_contrast(y=y, sr=sr)
+            # spectral flux 평균 (음악 변화량)
+            spectral_flux = float(np.mean(
+                librosa.onset.onset_strength(y=y, sr=sr)
             ))
 
             # MFCC 평균 (음색 특성, 13개 계수)
@@ -53,10 +53,10 @@ def extract_bgm_features(bgm_folder: str) -> dict:
                 'spectral_centroid': spectral_centroid,
                 'rms': rms,
                 'zcr': zcr,
-                'spectral_contrast': spectral_contrast,
+                'spectral_flux': spectral_flux,
                 'mfcc': mfcc_mean,
             }
-            print(f"  완료: tempo={tempo:.1f}, rms={rms:.4f}, zcr={zcr:.4f}, contrast={spectral_contrast:.2f}")
+            print(f"  완료: tempo={tempo:.1f}, rms={rms:.4f}, zcr={zcr:.4f}, flux={spectral_flux:.4f}")
 
         except Exception as e:
             print(f"  오류 ({filename}): {e}")
@@ -118,66 +118,91 @@ def analyze_sentiment(text: str) -> dict:
 def text_to_emotion_vector(text: str) -> np.ndarray:
     """
     전처리 → 감정 분석을 거쳐 장면 감정 벡터 생성
-    벡터 구성: [neg, neu, pos, compound]
+    벡터 구성: [valence, arousal]
+
+    VADER → valence/arousal 변환:
+    - valence : compound 값 그대로 사용 (-1~1)
+    - arousal : |pos - neg| 로 감정 강도 근사 (0~1)
     """
     processed = preprocess_text(text)
     sentiment = analyze_sentiment(processed)
 
-    vector = np.array([
-        sentiment['neg'],
-        sentiment['neu'],
-        sentiment['pos'],
-        sentiment['compound'],
-    ])
-    print(f"  감정 벡터: {vector}")
+    valence = sentiment['compound']
+    arousal = abs(sentiment['pos'] - sentiment['neg'])
+
+    vector = np.array([valence, arousal])
+    print(f"  감정 벡터: valence={valence:.3f}, arousal={arousal:.3f}")
     return vector
 
 
 # ── 3단계: BGM 매칭 ──────────────────────────────────────────
 def bgm_features_to_emotion_vector(features: dict) -> np.ndarray:
     """
-    BGM 음악 특성을 감정 벡터 [neg, neu, pos, compound]로 변환
+    BGM 음악 특성을 감정 벡터 [valence, arousal]로 변환
 
-    매핑 규칙:
-    - spectral_centroid 높음 → 밝고 긍정적 (pos)
-    - spectral_centroid 낮음 → 어둡고 부정적 (neg)
-    - zcr 높음 + rms 높음    → 타악기적/전투적 (neg)
-    - spectral_contrast 높음 → 강렬하고 긴장감 있음 (neg)
-    - tempo 낮음 + rms 낮음  → 차분/평화로움 (pos)
+    DEAM 학습 모델이 있으면 모델 사용,
+    없으면 경험적 규칙으로 근사
     """
+    import os
+    import joblib
+
+    feature_vector = np.array([[
+        features['rms'],
+        features.get('zcr', 0.05),
+        features['spectral_centroid'],
+        features.get('spectral_flux', 0.0),
+        features['mfcc'][0],
+        features['mfcc'][1],
+        features['mfcc'][2],
+        features['mfcc'][3],
+        features['mfcc'][4],
+        features['mfcc'][5],
+        features['mfcc'][6],
+        features['mfcc'][7],
+        features['mfcc'][8],
+        features['mfcc'][9],
+        features['mfcc'][10],
+        features['mfcc'][11],
+        features['mfcc'][12],
+    ]])
+
+    # DEAM 학습 모델이 있으면 사용
+    if os.path.exists('emotion_model.pkl'):
+        saved = joblib.load('emotion_model.pkl')
+        model = saved['model']
+        scaler = saved['scaler']
+        feature_scaled = scaler.transform(feature_vector)
+        valence, arousal = model.predict(feature_scaled)[0]
+        valence = float(np.clip(valence, -1, 1))
+        arousal = float(np.clip(arousal, 0, 1))
+        return np.array([valence, arousal])
+
+    # 모델 없으면 경험적 규칙으로 근사
     tempo = features['tempo']
     rms = features['rms']
     spectral_centroid = features['spectral_centroid']
     zcr = features.get('zcr', 0.05)
     spectral_contrast = features.get('spectral_contrast', 20.0)
 
-    # 정규화 기준값 (경험적 범위)
     TEMPO_MIN, TEMPO_MAX = 60.0, 200.0
     RMS_MIN, RMS_MAX = 0.01, 0.3
     SC_MIN, SC_MAX = 200.0, 4000.0
     ZCR_MIN, ZCR_MAX = 0.01, 0.2
     CONTRAST_MIN, CONTRAST_MAX = 5.0, 40.0
 
-    # 0~1 범위로 정규화
     tempo_norm = np.clip((tempo - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN), 0, 1)
     rms_norm = np.clip((rms - RMS_MIN) / (RMS_MAX - RMS_MIN), 0, 1)
     sc_norm = np.clip((spectral_centroid - SC_MIN) / (SC_MAX - SC_MIN), 0, 1)
     zcr_norm = np.clip((zcr - ZCR_MIN) / (ZCR_MAX - ZCR_MIN), 0, 1)
     contrast_norm = np.clip((spectral_contrast - CONTRAST_MIN) / (CONTRAST_MAX - CONTRAST_MIN), 0, 1)
 
-    # 긍정 점수: 밝은 음색 + 조용하고 차분한 느낌
-    pos = sc_norm * 0.5 + (1 - rms_norm) * 0.3 + (1 - zcr_norm) * 0.2
+    # valence: 밝은 음색일수록 긍정, 어둡고 강렬할수록 부정
+    valence = (sc_norm * 0.5 + (1 - zcr_norm) * 0.3 + (1 - contrast_norm) * 0.2) * 2 - 1
 
-    # 부정 점수: 어두운 음색 + 타악기적 + 강렬한 대비 + 빠른 템포
-    neg = (1 - sc_norm) * 0.35 + zcr_norm * 0.25 + contrast_norm * 0.25 + tempo_norm * 0.15
+    # arousal: 빠르고 에너지 높을수록 활성
+    arousal = tempo_norm * 0.4 + rms_norm * 0.4 + zcr_norm * 0.2
 
-    # 중립 점수
-    neu = 1.0 - (pos + neg) / 2
-
-    # compound: -1 ~ 1 범위
-    compound = np.clip(pos - neg, -1.0, 1.0)
-
-    return np.array([neg, neu, pos, compound])
+    return np.array([np.clip(valence, -1, 1), np.clip(arousal, 0, 1)])
 
 
 def match_bgm(emotion_vector: np.ndarray, bgm_db: dict, top_n: int = 3) -> list:
@@ -223,15 +248,11 @@ def recommend_bgm(scene_text: str, emotion_adjust: dict = None) -> list:
     emotion_vector = text_to_emotion_vector(scene_text)
 
     if emotion_adjust:
-        # 수동 보정값으로 감정 벡터 덮어쓰기
-        compound = np.clip(emotion_adjust['pos'] - emotion_adjust['neg'], -1.0, 1.0)
-        emotion_vector = np.array([
-            emotion_adjust['neg'],
-            emotion_adjust['neu'],
-            emotion_adjust['pos'],
-            compound,
-        ])
-        print(f"  수동 보정 벡터: {emotion_vector}")
+        # 수동 보정값을 valence/arousal로 변환
+        valence = np.clip(emotion_adjust['pos'] - emotion_adjust['neg'], -1.0, 1.0)
+        arousal = abs(emotion_adjust['pos'] - emotion_adjust['neg'])
+        emotion_vector = np.array([valence, arousal])
+        print(f"  수동 보정 벡터: valence={valence:.3f}, arousal={arousal:.3f}")
 
     bgm_db = load_bgm_db()
     results = match_bgm(emotion_vector, bgm_db)
@@ -304,14 +325,18 @@ def build_ui():
             bgm_db = load_bgm_db()
             processed = preprocess_text(scene_text)
             sentiment = analyze_sentiment(processed)
+            valence = sentiment['compound']
+            arousal = abs(sentiment['pos'] - sentiment['neg'])
             emotion_text = (
+                f"Valence (긍정/부정): {valence:.3f}  "
+                f"Arousal (활성/차분): {arousal:.3f}\n"
                 f"부정(neg): {sentiment['neg']:.3f}  "
                 f"중립(neu): {sentiment['neu']:.3f}  "
-                f"긍정(pos): {sentiment['pos']:.3f}  "
-                f"복합(compound): {sentiment['compound']:.3f}"
+                f"긍정(pos): {sentiment['pos']:.3f}"
             )
             if emotion_adjust:
-                emotion_text += f"\n수동 보정 적용: neg={emotion_adjust['neg']:.2f}, pos={emotion_adjust['pos']:.2f}, neu={emotion_adjust['neu']:.2f}"
+                adj_valence = emotion_adjust['pos'] - emotion_adjust['neg']
+                emotion_text += f"\n수동 보정: valence={adj_valence:.2f}, arousal={abs(adj_valence):.2f}"
 
             # 추천 결과 텍스트
             result_lines = []
