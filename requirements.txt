@@ -1,0 +1,6 @@
+konlpy
+vaderSentiment
+librosa
+scikit-learn
+gradio
+numpy
